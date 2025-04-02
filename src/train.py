@@ -15,7 +15,6 @@ import sys
 import pandas as pd
 import numpy as np
 from pathlib import Path
-
 import torch
 from datasets import Dataset, DatasetDict
 from transformers import (
@@ -46,9 +45,9 @@ logger = logging.getLogger(__name__)
 def setup_argparse():
     parser = argparse.ArgumentParser(description='Train a Kiswahili to Kikuyu translation model')
     parser.add_argument('--train_file', type=str, required=True,
-                        help='Path to the training CSV file')
+                        help='Path to the training text file')
     parser.add_argument('--validation_file', type=str, required=True,
-                        help='Path to the validation CSV file')
+                        help='Path to the validation text file')
     parser.add_argument('--source_lang', type=str, default='sw',
                         help='Source language code (default: sw for Kiswahili)')
     parser.add_argument('--target_lang', type=str, default='ki',
@@ -84,24 +83,29 @@ def setup_argparse():
     return parser.parse_args()
 
 def load_datasets(train_file, validation_file, source_lang, target_lang):
-    """Load training and validation datasets"""
-    # Load CSV files
-    train_df = pd.read_csv(train_file)
-    val_df = pd.read_csv(validation_file)
-    
-    # Convert to Hugging Face datasets
-    train_dataset = Dataset.from_pandas(train_df)
-    val_dataset = Dataset.from_pandas(val_df)
-    
-    # Combine into a DatasetDict
+    """Load parallel text datasets"""
+    # Read lines from text files
+    with open(train_file, 'r', encoding='utf-8') as f:
+        source_lines = f.readlines()
+    with open(validation_file, 'r', encoding='utf-8') as f:
+        target_lines = f.readlines()
+
+    # Ensure both files have the same number of lines
+    assert len(source_lines) == len(target_lines), "Source and target files must have the same number of lines"
+
+    # Create a dataset from the lines
+    data = {source_lang: source_lines, target_lang: target_lines}
+    dataset = Dataset.from_dict(data)
+
+    # Split into train and validation datasets
     dataset_dict = DatasetDict({
-        'train': train_dataset,
-        'validation': val_dataset
+        'train': dataset.select(range(int(len(dataset) * 0.8))),
+        'validation': dataset.select(range(int(len(dataset) * 0.8), len(dataset)))
     })
-    
-    logger.info(f"Loaded training set: {len(train_dataset)} examples")
-    logger.info(f"Loaded validation set: {len(val_dataset)} examples")
-    
+
+    logger.info("Loaded training set: {} examples".format(len(dataset_dict['train'])))
+    logger.info("Loaded validation set: {} examples".format(len(dataset_dict['validation'])))
+
     return dataset_dict
 
 def preprocess_function(examples, tokenizer, source_lang, target_lang, max_source_length, max_target_length):
@@ -161,12 +165,12 @@ def main():
     # Initialize tokenizer and model
     try:
         # First attempt to load a MarianMT model
-        logger.info(f"Attempting to load pretrained model: {args.pretrained_model}")
+        #logger.info(f"Attempting to load pretrained model: {args.pretrained_model}")
         tokenizer = MarianTokenizer.from_pretrained(args.pretrained_model)
         model = MarianMTModel.from_pretrained(args.pretrained_model)
         logger.info("Successfully loaded MarianMT model and tokenizer")
     except Exception as e:
-        logger.warning(f"Could not load MarianMT model. Error: {e}")
+        #logger.warning(f"Could not load MarianMT model. Error: {e}")
         logger.info("Falling back to generic sequence-to-sequence model")
         tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
         model = AutoModelForSeq2SeqLM.from_pretrained(args.pretrained_model)
@@ -213,27 +217,50 @@ def main():
     def compute_metrics_fixed(eval_preds):
         return compute_metrics(eval_preds, tokenizer, metric)
     
-    # Define training arguments
+    # Define training arguments with memory optimizations
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
-        evaluation_strategy="steps",
+        evaluation_strategy="epoch",
         eval_steps=500,
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         weight_decay=args.weight_decay,
-        save_total_limit=args.save_total_limit,
         num_train_epochs=args.num_train_epochs,
         predict_with_generate=True,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         logging_steps=args.logging_steps,
-        fp16=torch.cuda.is_available(),  # Use mixed precision if GPU is available
-        load_best_model_at_end=True,
-        metric_for_best_model="bleu",
-        greater_is_better=True,
-        report_to="tensorboard"
+
+        # Mixed Precision Training
+        bf16=torch.cuda.is_bf16_supported(),  # Use BF16 if available
+        fp16=not torch.cuda.is_bf16_supported(),  # Fallback to FP16 if BF16 is unavailable
+
+        # Model Optimization
+        optim="adamw_torch",  # AdamW is more stable than Adafactor
+        gradient_checkpointing=True,  # Save memory by checkpointing activations
+        max_grad_norm=1.0,  # Clip gradients to prevent memory spikes
+        warmup_ratio=0.1,  # Use warmup ratio instead of steps for better memory management
+        group_by_length=True,  # Reduce padding in batches to save memory
+        dataloader_num_workers=4,  # Multi-threaded data loading
+        dataloader_pin_memory=True,  # Speed up GPU memory transfer
+        dataloader_drop_last=True,  # Drop last batch for consistency
+
+        # Evaluation and Saving
+        eval_accumulation_steps=8,  # Accumulate evaluation steps to reduce memory usage
+        save_strategy="epoch" if args.batch_size > 8 else "steps",
+        save_steps=500 if args.batch_size > 8 else 100,
+        max_steps=-1,  # Train for the full number of epochs
+        disable_tqdm=True,  # Disable progress bar to save memory
+
+        # Early Stopping Fix
+        load_best_model_at_end=True,  # Ensure best model is restored
+        metric_for_best_model="eval_loss",  # Define a metric to monitor
+        greater_is_better=False,  # Lower loss is better
+        save_total_limit=2,  # Keep only the 2 best checkpoints
+
+        # Multi-GPU and Distributed Training
+        fsdp="full_shard auto_wrap" if torch.cuda.device_count() > 1 else "",  # Ensure fsdp is always a string
     )
-    
     # Initialize Trainer
     trainer = Seq2SeqTrainer(
         model=model,
@@ -247,15 +274,15 @@ def main():
     )
     
     # Train the model
-    logger.info("Starting training...")
+    #logger.info("Starting training...")
     trainer.train()
     
     # Save the final model and tokenizer
-    logger.info(f"Saving model to {args.output_dir}")
+    #logger.info(f"Saving model to {args.output_dir}")
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     
-    logger.info("Training completed successfully!")
+    #logger.info("Training completed successfully!")
 
 if __name__ == "__main__":
     main()

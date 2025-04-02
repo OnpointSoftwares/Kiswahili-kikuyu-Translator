@@ -116,7 +116,7 @@ def run_evaluate(args):
     logger.info("Running model evaluation...")
     cmd = [
         sys.executable,
-        os.path.join(PROJECT_DIR, 'src/evaluate.py'),
+        os.path.join(PROJECT_DIR, 'src/evaluate1.py'),
         '--model_dir', args.model_dir,
         '--test_file', args.test_file
     ]
